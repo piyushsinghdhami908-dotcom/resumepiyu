@@ -1,0 +1,1269 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en" data-theme="light"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        // Same as focusFragmentTarget in app/page.tsx; change both together.
+        const focusFragmentTarget = (target, focusVisible) => {
+          if (!document.hasFocus() || target === document.body) return;
+          target.focus({ preventScroll: true, focusVisible });
+          if (document.activeElement === target || target.hasAttribute("tabindex")) return;
+          const takeBack = () => {
+            if (document.activeElement === target) return;
+            target.removeAttribute("tabindex");
+            target.removeEventListener("blur", takeBack);
+          };
+          target.setAttribute("tabindex", "-1");
+          target.addEventListener("blur", takeBack);
+          target.focus({ preventScroll: true, focusVisible });
+          takeBack();
+        };
+
+        const scrollToFragment = (fragment, linkEl) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+            focusFragmentTarget(target, linkEl.matches(":focus-visible"));
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a, area[href]");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment, linkEl)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+        // Only for a page that still shows nothing a second later: one that draws usually works on after a refused sound or a failed side call.
+        // A frame hidden behind the code view has no height, so a full-window canvas there would read as empty.
+        window.addEventListener('unhandledrejection', (event) => setTimeout(() => {
+          if (event.defaultPrevented || document.readyState === 'loading' || !window.innerHeight) return;
+          for (const el of document.querySelectorAll('body *')) {
+            if (el.getBoundingClientRect().height > 0) return;
+          }
+          if (document.body?.innerText.trim()) return;
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + (event.reason?.message || event.reason) }, '*');
+        }, 1000));
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(o,t){const e=String,i=n=>{try{return e(n??"")}catch{return"[object Object]"}},c=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,s]of c){const f=o[n];o[n]=(...r)=>{f.apply(o,r),t(s+r.map(i).join(" "))}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <script>
+(function(){"use strict";if(window.__coworkHtmlReviewGuest)return;window.__coworkHtmlReviewGuest=true;var READY_TYPE="__cowork_html_review_ready__";var SEL_CLASS="__cwhr-sel";var CONTEXT_LEN=32;var EXACT_CAP=1000;var port=null;var mode=false;var chordLive=false;var pins=[];var quotes=[];var quoteRanges=Object.create(null);var hoverEl=null;var selected=null;var hasTextSel=false;var rafPending=false;var _MessageChannel=window.MessageChannel;var _topPost=window.top.postMessage.bind(window.top);function visibleText(el){var t=typeof el.innerText==="string"?el.innerText:(el.textContent||"");return t.replace(/\s+/g," ").trim();}var BUBBLE_CURSOR= "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";function injectStyle(){var style=document.createElement("style");var ANY=":not(#__cwhr_)";var MODE="html[data-cwhr-mode]";var COMPOSING=MODE+"[data-cwhr-composing]";style.textContent="."+SEL_CLASS+"{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}"+MODE+ANY+","+MODE+" "+ANY+"{cursor:"+BUBBLE_CURSOR+" !important;}"+COMPOSING+ANY+","+COMPOSING+" "+ANY+"{cursor:default !important;}";(document.head||document.documentElement).appendChild(style);}function isUnique(sel){try{return document.querySelectorAll(sel).length===1;}catch(e){return false;}}function hasInvisibles(s){for(var i=0;i<s.length;i++){var c=s.codePointAt(i);if(c>0xffff)i++;if(c<=0x1f||c===0x061c||c===0x070f||c===0xad||(c>=0x7f&&c<=0x9f)||c===0x115f||c===0x1160||c===0x180e||(c>=0x200b&&c<=0x200f)||(c>=0x202a&&c<=0x202e)||(c>=0x2060&&c<=0x2064)||(c>=0x2066&&c<=0x2069)||c===0x3164||c===0xfeff||(c>=0xfff9&&c<=0xfffb)||c===0xffa0||(c>=0xe0000&&c<=0xe007f)){return true;}}return false;}function escapeAttr(v){return String(v).replace(/\\/g,"\\\\").replace(/"/g,'\\"');}function selectorFor(el){if(el.id&&!hasInvisibles(el.id)&&isUnique("#"+CSS.escape(el.id))){return"#"+CSS.escape(el.id);}for(var i=0;i<el.attributes.length;i++){var attr=el.attributes[i];if(attr.name.indexOf("data-")===0&&attr.value&&!hasInvisibles(attr.value)){var dataSel="["+attr.name+'="'+escapeAttr(attr.value)+'"]';if(isUnique(dataSel))return dataSel;}}var parts=[];var cur=el;while(cur&&cur!==document.body&&cur.nodeType===1&&parts.length<10){var sel=cur.tagName.toLowerCase();var parent=cur.parentElement;if(parent){var sameTag=[];for(var c=0;c<parent.children.length;c++){if(parent.children[c].tagName===cur.tagName)sameTag.push(parent.children[c]);}if(sameTag.length>1){sel+=":nth-of-type("+(sameTag.indexOf(cur)+1)+")";}}parts.unshift(sel);if(parent&&parent.id&&!hasInvisibles(parent.id)&&isUnique("#"+CSS.escape(parent.id))){parts.unshift("#"+CSS.escape(parent.id));return parts.join(" > ");}cur=parent;}if(cur===document.body){parts.unshift("body");return parts.join(" > ");}return":not(*)";}function descriptorFor(el){var tag="<"+el.tagName.toLowerCase()+">";var idPart=el.id?" #"+el.id:"";var text=visibleText(el).slice(0,60);var textPart=text?' "'+text+'"':"";var section=el.parentElement;while(section&&(!section.id||section.id.indexOf("artifacts-component-root")===0)){section=section.parentElement;}var sectionPart=section&&section.id?" in #"+section.id:"";return(tag+idPart+textPart+sectionPart).slice(0,400);}function textOffset(node,offset){var body=document.body;if(!body)return-1;try{var pre=document.createRange();pre.selectNodeContents(body);pre.setEnd(node,offset);return pre.toString().length;}catch(e){return-1;}}function rangeForOffsets(start,end){var body=document.body;if(!body)return null;var walker=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);var acc=0;var range=document.createRange();var haveStart=false;var t;while((t=walker.nextNode())){var next=acc+t.length;if(!haveStart&&start<next){range.setStart(t,start-acc);haveStart=true;}if(haveStart&&end<=next){range.setEnd(t,end-acc);return range;}acc=next;}return null;}function locateQuote(text,q){var ex=q.exact;if(!ex)return null;var hint=q.startOffset>=0?q.startOffset:0;if(text.slice(hint,hint+ex.length)===ex){return{start:hint,end:hint+ex.length};}var best=-1;var bestScore=-1;var bestDist=Infinity;var scanned=0;for(var idx=text.indexOf(ex);idx!==-1&&++scanned<=1000;idx=text.indexOf(ex,idx+1)){var before=text.slice(Math.max(0,idx-CONTEXT_LEN),idx);var after=text.slice(idx+ex.length,idx+ex.length+CONTEXT_LEN);var sc=0;for(var i=1;i<=q.prefix.length&&i<=before.length;i++){if(q.prefix[q.prefix.length-i]!==before[before.length-i])break;sc++;}for(var j=0;j<q.suffix.length&&j<after.length;j++){if(q.suffix[j]!==after[j])break;sc++;}var dist=Math.abs(idx-hint);if(sc>bestScore||(sc===bestScore&&dist<bestDist)){best=idx;bestScore=sc;bestDist=dist;}}return best===-1?null:{start:best,end:best+ex.length};}function collectLineRects(range,cap){var out=[];var rects=range.getClientRects();for(var i=0;i<rects.length&&out.length<cap;i++){var r=rects[i];if(r.width>0&&r.height>0){out.push({x:r.left,y:r.top,w:r.width,h:r.height});}}return out;}function reportTextSel(full){if(!port)return;var sel=window.getSelection();var r=sel&&!sel.isCollapsed&&sel.rangeCount>0?sel.getRangeAt(0):null;if(!r||!document.body||!document.body.contains(r.commonAncestorContainer)){if(hasTextSel){hasTextSel=false;port.postMessage({type:"textClear"});}return;}hasTextSel=true;var br=r.getBoundingClientRect();var msg={type:"textCapture",rect:{x:br.left,y:br.top,w:br.width,h:br.height},lineRects:collectLineRects(r,80),};if(full){var live=document.body.textContent||"";var so=textOffset(r.startContainer,r.startOffset);var eo=textOffset(r.endContainer,r.endOffset);if(so<0||eo<0||eo<=so){hasTextSel=false;port.postMessage({type:"textClear"});return;}var capped=Math.min(eo,so+EXACT_CAP);if(capped<eo){var hc=live.charCodeAt(capped-1);if(hc>=0xd800&&hc<=0xdbff)capped--;}if(capped<=so){port.postMessage(msg);return;}var pStart=Math.max(0,so-CONTEXT_LEN);var pc=live.charCodeAt(pStart);if(pc>=0xdc00&&pc<=0xdfff)pStart++;var sEnd=Math.min(live.length,capped+CONTEXT_LEN);if(sEnd<live.length){var sc=live.charCodeAt(sEnd-1);if(sc>=0xd800&&sc<=0xdbff)sEnd--;}msg.exact=live.slice(so,capped);msg.prefix=live.slice(pStart,so);msg.suffix=live.slice(capped,sEnd);msg.startOffset=so;msg.endOffset=capped;}port.postMessage(msg);}function clearSelection(){if(selected){selected.classList.remove(SEL_CLASS);selected=null;}}var cursorPending=false;var cursorX=-1;var cursorY=-1;function flushCursor(){cursorPending=false;if(!port)return;var hover=null;if(hoverEl&&hoverEl.nodeType===1&&hoverEl!==document.body&&hoverEl!==document.documentElement){var r=hoverEl.getBoundingClientRect();if(r.width>0||r.height>0){hover={x:r.left,y:r.top,w:r.width,h:r.height};}}port.postMessage({type:"cursor",x:cursorX,y:cursorY,hover:hover});}function scheduleCursor(){if(!cursorPending){cursorPending=true;requestAnimationFrame(flushCursor);}}function onMouseMove(ev){if(!mode||!port)return;var de=document.documentElement;if(ev.clientX>=de.clientWidth||ev.clientY>=de.clientHeight){cursorX=-1;cursorY=-1;hoverEl=null;scheduleCursor();return;}cursorX=ev.clientX;cursorY=ev.clientY;hoverEl=ev.target;scheduleCursor();}function onMouseLeave(){if(!mode||!port)return;cursorX=-1;cursorY=-1;hoverEl=null;scheduleCursor();}function onClick(ev){if(!port)return;if(!mode){var s=window.getSelection();if(!s||s.isCollapsed)port.postMessage({type:"clickAway"});return;}ev.preventDefault();ev.stopImmediatePropagation();var el=ev.target;if(!el||el.nodeType!==1||el===document.documentElement)return;if(el===document.body&&el.firstElementChild){}clearSelection();selected=el;el.classList.add(SEL_CLASS);var rect=el.getBoundingClientRect();var pinX=rect.width>0?(ev.clientX-rect.left)/ rect.width:0.5;var pinY=rect.height>0?(ev.clientY-rect.top)/ rect.height:0.5;port.postMessage({type:"capture",selector:selectorFor(el).slice(0,1000),textHint:visibleText(el).slice(0,300),descriptor:descriptorFor(el),pinX:Math.min(1,Math.max(0,pinX)),pinY:Math.min(1,Math.max(0,pinY)),clientX:ev.clientX,clientY:ev.clientY,rectLeft:rect.left,rectTop:rect.top,});}var keyEl=null;var keyAt=-1;function collectBlocks(el,out){for(var c=el.firstElementChild;c&&out.length<2000;c=c.nextElementSibling){var drawn=c.getClientRects().length>0;var own=/^(tr|img|svg|canvas|video|iframe|input|select|textarea|button|pre)$/i.test(c.tagName);for(var n=c.firstChild;n&&!own;n=n.nextSibling)own=n.nodeType===3&&/\S/.test(n.data);if(drawn&&own)out.push(c);var inner=!own||c.querySelector("p,h1,h2,h3,h4,h5,h6,li")?c:null;if(inner&&(drawn||getComputedStyle(c).display==="contents"))collectBlocks(inner,out);}return out;}function step(by){if(!mode||by===null)return onMouseLeave();var blocks=collectBlocks(document.body,[]);var i=blocks.indexOf(keyEl);if(i<0&&keyEl)i=keyAt;if(i<0)i=blocks.findIndex(function(b){return b.getBoundingClientRect().top>=0;});else i+=by;i=Math.max(0,Math.min(blocks.length-1,i));keyEl=hoverEl=blocks[i]||null;keyAt=i;if(!keyEl)return;keyEl.scrollIntoView({block:"nearest",inline:"nearest",behavior:"instant"});cursorX=cursorY=0;scheduleCursor();var text=visibleText(keyEl)||keyEl.getAttribute("alt")||keyEl.getAttribute("aria-label")||keyEl.tagName.toLowerCase();port.postMessage({type:"block",text:text.slice(0,300),index:i,count:blocks.length});}function pick(){if(!mode||!keyEl||!keyEl.isConnected)return;var r=keyEl.getBoundingClientRect();var nothing=function(){};onClick({target:keyEl,clientX:Math.max(0,r.left)+Math.min(12,r.width/ 2),clientY:Math.max(0,r.top)+Math.min(12,r.height/ 2),preventDefault:nothing,stopImmediatePropagation:nothing,});}function reportRects(){rafPending=false;if(!port)return;if(selected){var sr=selected.getBoundingClientRect();port.postMessage({type:"selRect",left:sr.left,top:sr.top,w:sr.width,h:sr.height,found:(sr.width>0||sr.height>0)&&document.documentElement.contains(selected),});}var rects=[];for(var i=0;i<pins.length;i++){var p=pins[i];var el=null;try{el=document.querySelector(p.selector);}catch(e){el=null;}if(!el){rects.push({id:p.id,x:0,y:0,found:false});continue;}var r=el.getBoundingClientRect();if(r.width===0&&r.height===0){rects.push({id:p.id,x:0,y:0,found:false});continue;}rects.push({id:p.id,x:r.left+p.pinX*r.width,y:r.top+p.pinY*r.height,found:true,});}var quoteRects=[];if(quotes.length>0){var live=null;for(var qi=0;qi<quotes.length;qi++){var q=quotes[qi];var qr=quoteRanges[q.id];if(qr===undefined){if(live===null){live=(document.body&&document.body.textContent)||"";}var loc=locateQuote(live,q);qr=(loc&&rangeForOffsets(loc.start,loc.end))||null;quoteRanges[q.id]=qr;}var qlr=qr?collectLineRects(qr,80):[];quoteRects.push(qlr.length>0?{id:q.id,found:true,lineRects:qlr}:{id:q.id,found:false,lineRects:[]});}}sentScrollY=window.scrollY||0;port.postMessage({type:"rects",rects:rects,quoteRects:quoteRects,scrollY:sentScrollY,});}function scheduleRects(){if(rafPending)return;rafPending=true;var done=false;function run(){if(done)return;done=true;reportRects();}requestAnimationFrame(run);setTimeout(run,150);}var sentScrollY=0;function scheduleAnchoredRects(){if(selected||pins.length>0||quotes.length>0)scheduleRects();}function setMode(on){mode=!!on;document.documentElement.toggleAttribute("data-cwhr-mode",mode);if(!mode){hoverEl=keyEl=null;clearSelection();}}function setComposing(open){document.documentElement.toggleAttribute("data-cwhr-composing",!!open);}function onPortMessage(ev){var data=ev.data;if(!data)return;if(data.type==="mode")setMode(data.on);else if(data.type==="composing")setComposing(data.open);else if(data.type==="chordLive")chordLive=!!data.on;else if(data.type==="step")step(data.by);else if(data.type==="pick")pick();else if(data.type==="pins"){pins=Array.isArray(data.pins)?data.pins:[];scheduleRects();}else if(data.type==="quotes"){quotes=Array.isArray(data.quotes)?data.quotes:[];quoteRanges=Object.create(null);scheduleRects();}else if(data.type==="clearSelection"){clearSelection();}else if(data.type==="clearTextSel"){var ts=window.getSelection();if(ts)ts.removeAllRanges();hasTextSel=false;}else if(data.type==="restoreScroll"){var ry=Number(data.y);if(isFinite(ry)&&ry>0){window.scrollTo(0,ry);window.addEventListener("load",function(){window.scrollTo(0,ry);});}}}function start(){injectStyle();var channel=new _MessageChannel();port=channel.port1;port.onmessage=onPortMessage;_topPost({type:READY_TYPE,token:"7144763b-092a-42d7-a96b-f451bdac2883"},"*",[channel.port2]);document.addEventListener("mousemove",onMouseMove,true);document.documentElement.addEventListener("mouseleave",onMouseLeave);document.addEventListener("click",onClick,true);function onSelCommit(){reportTextSel(true);}document.addEventListener("mouseup",onSelCommit,true);document.addEventListener("keyup",onSelCommit,true);document.addEventListener("selectionchange",function(){var s=window.getSelection();if(hasTextSel&&(!s||s.isCollapsed))reportTextSel(false);});document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&port)port.postMessage({type:"dismiss"});if(chordLive&&port&&ev.altKey){var t=ev.composedPath?ev.composedPath()[0]:ev.target;var editable=!!t&&(t.isContentEditable===true||t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.tagName==="SELECT");if(!editable&&ev.code==="KeyC"&&!ev.metaKey&&!ev.ctrlKey&&!ev.shiftKey)ev.preventDefault();if(!ev.repeat){port.postMessage({type:"chord",key:ev.key,code:ev.code,meta:ev.metaKey,ctrl:ev.ctrlKey,shift:ev.shiftKey,composing:ev.isComposing===true,editable:editable,});}}},true);var textSelPending=false;function scheduleTextSel(){if(textSelPending)return;textSelPending=true;requestAnimationFrame(function(){textSelPending=false;reportTextSel(false);});}function onLayoutChange(){scheduleRects();if(mode&&hoverEl)scheduleCursor();if(hasTextSel)scheduleTextSel();}window.addEventListener("scroll",onLayoutChange,true);window.addEventListener("resize",onLayoutChange);var observer=new MutationObserver(function(){quoteRanges=Object.create(null);scheduleAnchoredRects();if(hasTextSel)scheduleTextSel();});function observe(){if(document.body)observer.observe(document.body,{childList:true,subtree:true});}if(document.body)observe();else document.addEventListener("DOMContentLoaded",observe);setInterval(function(){if((window.scrollY||0)!==sentScrollY)scheduleRects();else scheduleAnchoredRects();},2000);}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",start);}else{start();}})();
+</script>
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Manas College Resume Studio</title>
+<meta name="description" content="Free resume builder with 100 templates. Works offline, no sign-up. Download as PDF.">
+<style>
+/* =========================================================
+   APP UI
+   ========================================================= */
+:root{
+  --bg:#f4f5fb;--sf:#fff;--sf2:#f8f9fd;--bd:#e5e7f2;--bd2:#d3d6e8;
+  --tx:#1c1e33;--mu:#7a7f9c;--p:#5b5bf0;--p2:#8a5cf6;--ok:#10b981;--ok2:#06b6d4;
+  --ring:rgba(91,91,240,.28);
+  --sh1:0 1px 2px rgba(28,30,51,.06),0 1px 1px rgba(28,30,51,.04);
+  --sh2:0 8px 20px -8px rgba(28,30,51,.16),0 2px 6px rgba(28,30,51,.06);
+  --sh3:0 26px 60px -16px rgba(40,38,110,.3),0 8px 20px -8px rgba(28,30,51,.12);
+  --glass:rgba(255,255,255,.82);
+  --font:"Inter","Segoe UI Variable","Segoe UI",system-ui,-apple-system,"Helvetica Neue",Roboto,Arial,sans-serif;
+}
+html[data-theme="dark"]{
+  --bg:#0e0f1f;--sf:#16172e;--sf2:#1d1f3d;--bd:#2a2c52;--bd2:#3a3d6b;
+  --tx:#eceefb;--mu:#9a9fc4;--ring:rgba(138,140,255,.38);
+  --sh1:0 1px 2px rgba(0,0,0,.4);--sh2:0 8px 22px -8px rgba(0,0,0,.6);--sh3:0 28px 64px -18px rgba(0,0,0,.75);
+  --glass:rgba(22,23,46,.8);
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:var(--font);background:var(--bg);color:var(--tx);-webkit-font-smoothing:antialiased;font-size:14px}
+button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit}
+::selection{background:rgba(91,91,240,.25)}
+#app{height:100vh;height:100dvh;display:flex;flex-direction:column}
+
+/* top bar */
+.top{display:flex;align-items:center;gap:10px;padding:10px 18px;background:var(--glass);
+  backdrop-filter:saturate(180%) blur(14px);-webkit-backdrop-filter:saturate(180%) blur(14px);
+  border-bottom:1px solid var(--bd);box-shadow:0 8px 24px -18px rgba(40,38,110,.4);position:relative;z-index:5;overflow-x:auto;scrollbar-width:none}
+.top::-webkit-scrollbar{display:none}
+.sp{flex:1}
+.brand{display:inline-flex;align-items:center;gap:10px;font-weight:800;font-size:17px;letter-spacing:-.02em;white-space:nowrap}
+.logo{width:32px;height:32px;border-radius:10px;background:linear-gradient(135deg,var(--p),var(--p2));
+  box-shadow:0 6px 14px -4px rgba(91,91,240,.55),inset 0 1px 0 rgba(255,255,255,.35);display:grid;place-items:center}
+.logo svg{width:17px;height:17px;stroke:#fff;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.brand small{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--p);background:rgba(91,91,240,.12);padding:3px 8px;border-radius:999px}
+
+.btn{font-weight:600;font-size:13px;color:var(--tx);background:var(--sf);border:1px solid var(--bd2);border-radius:10px;
+  padding:8px 14px;box-shadow:var(--sh1);cursor:pointer;white-space:nowrap;
+  transition:transform .15s ease,box-shadow .2s ease,background .2s ease,border-color .2s ease,filter .2s ease}
+.btn:hover{transform:translateY(-1px);box-shadow:var(--sh2);background:var(--sf2)}
+.btn:active{transform:scale(.98)}
+.btn:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--p);outline-offset:2px}
+.btn.primary{color:#fff;border-color:transparent;background:linear-gradient(135deg,var(--p),var(--p2));box-shadow:0 8px 18px -6px rgba(91,91,240,.6),inset 0 1px 0 rgba(255,255,255,.25)}
+.btn.primary:hover{background:linear-gradient(135deg,#6a6af5,#9a6cf8)}
+.btn.accent{color:#fff;border-color:transparent;background:linear-gradient(135deg,var(--ok),var(--ok2));box-shadow:0 8px 18px -6px rgba(16,185,129,.6),inset 0 1px 0 rgba(255,255,255,.25)}
+.btn.accent:hover{filter:brightness(1.06) saturate(1.05)}
+.btn.sm{padding:5px 10px;font-size:12.5px;border-radius:8px;box-shadow:none}
+.btn.round{width:38px;height:38px;padding:0;border-radius:999px;font-size:16px;line-height:1;display:inline-grid;place-items:center}
+
+/* layout */
+.main{flex:1;display:flex;min-height:0}
+.editor{width:440px;flex:none;display:flex;flex-direction:column;background:var(--sf);border-right:1px solid var(--bd);box-shadow:8px 0 30px -24px rgba(40,38,110,.4);min-width:0}
+.tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid var(--bd);overflow-x:auto;scrollbar-width:none;flex:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{border:1px solid transparent;background:transparent;color:var(--mu);font-weight:600;font-size:12.5px;padding:7px 13px;border-radius:999px;cursor:pointer;white-space:nowrap;transition:all .18s ease}
+.tab:hover{color:var(--tx);background:var(--sf2)}
+.tab.on{color:#fff;background:linear-gradient(135deg,var(--p),var(--p2));box-shadow:0 6px 14px -6px rgba(91,91,240,.65)}
+.form{flex:1;overflow:auto;padding:18px;scrollbar-width:thin}
+.form>*{animation:fade .25s ease both}
+.fld{margin-bottom:13px}
+.fld label{display:block;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--mu);margin-bottom:6px}
+.fld input,.fld textarea,.fld select{width:100%;padding:10px 12px;background:var(--sf2);border:1px solid var(--bd);border-radius:10px;transition:border-color .18s,box-shadow .18s,background .18s}
+.fld textarea{resize:vertical;line-height:1.5}
+.fld input::placeholder,.fld textarea::placeholder{color:#a6aac4}
+.fld input:hover,.fld textarea:hover{border-color:var(--bd2)}
+.fld input:focus,.fld textarea:focus{outline:none;background:var(--sf);border-color:var(--p);box-shadow:0 0 0 4px var(--ring)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.hint{font-size:12px;color:var(--mu);margin-top:5px}
+.card{border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:14px;background:var(--sf);box-shadow:var(--sh1);transition:box-shadow .2s,border-color .2s}
+.card:hover{border-color:var(--bd2);box-shadow:var(--sh2)}
+.ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-weight:700}
+.ib{display:flex;gap:4px}
+.ibtn{width:28px;height:28px;border-radius:8px;border:1px solid var(--bd);background:var(--sf2);cursor:pointer;color:var(--mu);transition:all .15s}
+.ibtn:hover{color:var(--tx);border-color:var(--bd2)}
+.ibtn.del:hover{color:#e11d48;border-color:#fda4af;background:rgba(225,29,72,.08)}
+.add{width:100%;padding:12px;border:2px dashed var(--bd2);background:transparent;color:var(--p);font-weight:700;border-radius:12px;cursor:pointer;transition:all .18s}
+.add:hover{background:rgba(91,91,240,.07);border-color:var(--p)}
+.photoRow{display:flex;gap:14px;align-items:center;margin-bottom:16px}
+.pav{width:72px;height:72px;border-radius:50%;background:var(--sf2);border:2px dashed var(--bd2);display:grid;place-items:center;font-size:26px;overflow:hidden;flex:none}
+.pav img{width:100%;height:100%;object-fit:cover}
+.sectitle{font-size:15px;font-weight:800;letter-spacing:-.01em;margin:2px 0 14px}
+
+/* preview */
+.preview{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;
+  background:radial-gradient(900px 500px at 85% -10%,rgba(138,92,246,.15),transparent 60%),radial-gradient(700px 480px at -5% 110%,rgba(6,182,212,.12),transparent 60%),var(--bg)}
+.zoombar{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:3;display:flex;align-items:center;gap:6px;padding:5px 8px;
+  background:var(--glass);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--bd);border-radius:999px;box-shadow:var(--sh2);font-size:12.5px;font-weight:600}
+.zoombar .btn.sm{border-radius:999px;min-width:30px}
+#zVal{min-width:46px;text-align:center;font-variant-numeric:tabular-nums}
+#pages{font-size:12px;font-weight:600;background:rgba(91,91,240,.1);color:var(--p);padding:3px 10px;border-radius:999px}
+.stage{flex:1;overflow:auto;padding:76px 30px 50px;background-image:radial-gradient(rgba(91,91,240,.16) 1px,transparent 1.4px);background-size:22px 22px;scrollbar-width:thin}
+.sheetWrap{margin:0 auto;position:relative;filter:drop-shadow(0 24px 40px rgba(40,38,110,.22)) drop-shadow(0 4px 10px rgba(28,30,51,.1))}
+html[data-theme="dark"] .sheetWrap{filter:drop-shadow(0 28px 48px rgba(0,0,0,.6)) drop-shadow(0 4px 12px rgba(0,0,0,.4))}
+#sheet{position:absolute;left:0;top:0;width:794px;transform-origin:0 0}
+.pgline{position:absolute;left:0;right:0;height:0;border-top:2px dashed rgba(225,29,72,.5);pointer-events:none;z-index:2}
+.pgline span{position:absolute;right:8px;top:-10px;font:600 10px/1 var(--font);background:#e11d48;color:#fff;padding:3px 8px;border-radius:999px}
+
+/* gallery */
+.gal{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(20,20,45,.55);backdrop-filter:blur(10px) saturate(140%);-webkit-backdrop-filter:blur(10px) saturate(140%);animation:fade .22s ease both;padding:14px}
+.gal[hidden]{display:none}
+.galBox{width:min(1120px,100%);height:min(88vh,860px);display:flex;flex-direction:column;background:var(--sf);border:1px solid var(--bd);border-radius:22px;box-shadow:var(--sh3);overflow:hidden;animation:pop .28s cubic-bezier(.2,.9,.3,1.2) both}
+.galHead{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--bd);background:linear-gradient(180deg,var(--sf),var(--sf2))}
+.galHead b{font-size:17px;font-weight:800;letter-spacing:-.02em;white-space:nowrap}
+.galHead input{flex:1;min-width:0;padding:9px 14px;border-radius:999px;border:1px solid var(--bd);background:var(--sf2)}
+.galHead input:focus{outline:none;border-color:var(--p);box-shadow:0 0 0 4px var(--ring);background:var(--sf)}
+.cats{display:flex;gap:8px;padding:12px 18px;overflow-x:auto;scrollbar-width:none;flex:none;border-bottom:1px solid var(--bd)}
+.cats::-webkit-scrollbar{display:none}
+.cat{border:1px solid var(--bd);background:var(--sf2);color:var(--mu);font-weight:600;font-size:12.5px;padding:6px 14px;border-radius:999px;cursor:pointer;white-space:nowrap;transition:all .18s}
+.cat:hover{color:var(--tx);border-color:var(--bd2);transform:translateY(-1px)}
+.cat.on{color:#fff;border-color:transparent;background:linear-gradient(135deg,var(--p),var(--p2));box-shadow:0 6px 14px -6px rgba(91,91,240,.65)}
+.galGrid{flex:1;overflow:auto;padding:18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:18px;align-content:start;grid-auto-rows:max-content;align-items:start;background:var(--bg);scrollbar-width:thin}
+.tcard{min-height:1px;flex:none;background:var(--sf);border:1px solid var(--bd);border-radius:16px;box-shadow:var(--sh1);overflow:hidden;cursor:pointer;transition:transform .22s cubic-bezier(.2,.8,.3,1),box-shadow .25s,border-color .2s;position:relative}
+.tcard:hover{transform:translateY(-5px);border-color:rgba(91,91,240,.5);box-shadow:var(--sh3)}
+.tcard.on{border-color:var(--p);box-shadow:0 0 0 3px var(--ring),var(--sh2)}
+.tcard.on::after{content:"✓ Selected";position:absolute;top:8px;right:8px;background:var(--p);color:#fff;font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:999px}
+.tprev{height:0;padding-bottom:141.4%;overflow:hidden;position:relative;background:#fff;border-bottom:1px solid var(--bd)}
+.tprev .pv{position:absolute;left:0;top:0;width:794px;transform-origin:0 0}
+.tinfo{padding:9px 12px}
+.tinfo b{display:block;font-size:12.5px}
+.tinfo span{font-size:11.5px;color:var(--mu)}
+.empty{grid-column:1/-1;text-align:center;color:var(--mu);padding:40px}
+
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);background:#1c1e33;color:#fff;padding:11px 18px;border-radius:12px;font-size:13px;font-weight:500;box-shadow:var(--sh3);opacity:0;pointer-events:none;transition:all .3s ease;z-index:99;max-width:92vw;text-align:center}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.mnav{display:none}
+
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes pop{from{opacity:0;transform:translateY(14px) scale(.97)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+
+@media (max-width:900px){
+  .brand small{display:none}
+  .editor{width:100%;border-right:0}
+  .preview{display:none}
+  body.pv .editor{display:none}
+  body.pv .preview{display:flex}
+  .stage{padding:70px 12px 90px}
+  .form{padding:14px 14px 90px}
+  .mnav{display:flex;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:20;gap:4px;padding:5px;border-radius:999px;background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid var(--bd);box-shadow:var(--sh3)}
+  .mnav button{border:0;background:transparent;color:var(--mu);font-weight:700;padding:10px 22px;border-radius:999px;cursor:pointer}
+  .mnav button.on{color:#fff;background:linear-gradient(135deg,var(--p),var(--p2))}
+  .g2{grid-template-columns:1fr}
+}
+
+/* =========================================================
+   RESUME TEMPLATES  (A4 = 794 x 1123 px)
+   ========================================================= */
+#printRoot{display:none}
+.rs{--ad:color-mix(in srgb,var(--a) 78%,#000);--at:color-mix(in srgb,var(--a) 9%,#fff);--am:color-mix(in srgb,var(--a) 32%,#fff);
+  width:794px;min-height:1120px;background:#fff;color:#222733;position:relative;
+  font:13px/1.55 "Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+  -webkit-print-color-adjust:exact;print-color-adjust:exact}
+.rs *{box-sizing:border-box;margin:0;padding:0}
+.rs table.pg{width:100%;border-collapse:collapse}
+.rs table.pg>thead>tr>td,.rs table.pg>tbody>tr>td,.rs table.pg>tfoot>tr>td{padding:0;vertical-align:top}
+.rs .sp{display:block;height:34px}
+.rs h1,.rs h2,.rs h3{font-weight:700}
+.rs p{margin:0 0 3px}
+.rs ul{list-style:disc;padding-left:17px;margin:3px 0 0}
+.rs li{margin:1px 0}
+.rs .item{break-inside:avoid;margin-bottom:12px}
+.rs .row{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.rs .role{font-weight:700;font-size:13.5px}
+.rs .org{color:var(--a);font-weight:600}
+.rs .dt{font-size:11.5px;color:#6b7280;white-space:nowrap}
+.rs .sub{font-size:12px;color:#6b7280}
+.rs .desc{margin-top:3px;color:#374151}
+.rs .lnk{font-size:11.5px;color:var(--a);font-weight:500}
+.rs .ct{display:flex;align-items:center;gap:7px;margin:4px 0;word-break:break-word}
+.rs .ct svg{width:13px;height:13px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.rs .cts{display:flex;flex-wrap:wrap;gap:2px 16px}
+.rs .cts .ct{margin:2px 0}
+.rs .chips{display:flex;flex-wrap:wrap;gap:6px}
+.rs .chips span{padding:3px 10px;border-radius:999px;font-size:11.5px;background:var(--at);color:var(--ad);border:1px solid var(--am)}
+.rs .ph{width:112px;height:112px;border-radius:50%;object-fit:cover;display:block}
+.rs .ln{margin:2px 0}
+.rs .sec{margin-bottom:16px}
+
+/* 1 Classic */
+.t-classic{font-family:Georgia,"Times New Roman",serif;padding:0 52px}
+.t-classic .hd{text-align:center;padding-bottom:12px;border-bottom:2px solid var(--a);margin-bottom:16px}
+.t-classic h1{font-size:34px;letter-spacing:.5px}
+.t-classic .ttl{color:var(--a);font-size:15px;margin-top:2px;font-style:italic}
+.t-classic .cts{justify-content:center;margin-top:8px;font-size:12px;color:#444;font-family:"Segoe UI",system-ui,Arial,sans-serif}
+.t-classic h2{font-size:13px;text-transform:uppercase;letter-spacing:1.6px;color:var(--ad);border-bottom:1px solid #ccc;padding-bottom:3px;margin-bottom:8px}
+
+/* 2 Sidebar left */
+.t-side{background:linear-gradient(90deg,var(--ad) 0,var(--ad) 256px,#fff 256px)}
+.t-side .g{display:grid;grid-template-columns:256px 1fr}
+.t-side .sb{color:#fff;padding:2px 24px 0}
+.t-side .mn{padding:2px 34px 0 32px}
+.t-side .sb .ph{margin:0 auto 8px;border:3px solid rgba(255,255,255,.6)}
+.t-side .sb h2{font-size:12px;text-transform:uppercase;letter-spacing:1.5px;border-bottom:1px solid rgba(255,255,255,.35);padding-bottom:4px;margin:0 0 8px}
+.t-side .sb .sec{margin-bottom:18px}
+.t-side .sb .chips span{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.3);color:#fff}
+.t-side .mn h1{font-size:34px;color:var(--ad);line-height:1.1}
+.t-side .mn .ttl{font-size:15px;color:#555;margin:3px 0 18px}
+.t-side .mn h2{font-size:14px;text-transform:uppercase;letter-spacing:1.4px;color:var(--ad);display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.t-side .mn h2::after{content:"";flex:1;height:2px;background:var(--am)}
+
+/* 3 Sidebar right */
+.t-sider{background:linear-gradient(90deg,#fff 0,#fff calc(100% - 250px),var(--am) calc(100% - 250px),var(--am) calc(100% - 249px),var(--at) calc(100% - 249px))}
+.t-sider .g{display:grid;grid-template-columns:1fr 250px}
+.t-sider .mn{padding:2px 28px 0 38px}
+.t-sider .sb{padding:2px 22px 0 22px}
+.t-sider .mn h1{font-size:36px;line-height:1.1;color:#111}
+.t-sider .mn .ttl{font-size:15px;color:var(--a);margin:3px 0 8px;font-weight:600}
+.t-sider .mn .bar{width:56px;height:4px;background:var(--a);border-radius:2px;margin-bottom:18px}
+.t-sider h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--ad);margin-bottom:8px}
+.t-sider .sb h2{border-bottom:2px solid var(--a);padding-bottom:3px}
+.t-sider .sb .ph{margin:0 0 14px}
+
+/* 4 Banner */
+.t-banner .bn{margin-top:-34px;padding:62px 44px 28px;background:linear-gradient(120deg,var(--ad),var(--a));color:#fff;display:flex;align-items:center;justify-content:space-between;gap:20px}
+.t-banner .bn h1{font-size:36px;line-height:1.1}
+.t-banner .bn .ttl{font-size:15px;opacity:.92;margin-top:3px}
+.t-banner .bn .cts{margin-top:10px;font-size:12px;gap:2px 18px}
+.t-banner .bn .ph{border:3px solid rgba(255,255,255,.7)}
+.t-banner .g{display:grid;grid-template-columns:1fr 228px;gap:0 30px;padding:22px 44px 0}
+.t-banner h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--ad);padding-bottom:4px;border-bottom:2px solid var(--a);margin-bottom:8px}
+
+/* 5 Minimal */
+.t-min{padding:0 50px}
+.t-min .hd{margin-bottom:16px}
+.t-min h1{font-size:42px;font-weight:300;letter-spacing:-.5px;line-height:1.1}
+.t-min h1 b{font-weight:800}
+.t-min .ttl{color:var(--a);letter-spacing:3px;text-transform:uppercase;font-size:12px;margin-top:6px;font-weight:600}
+.t-min .cts{margin-top:10px;color:#555;font-size:12px}
+.t-min .sec{display:grid;grid-template-columns:128px 1fr;gap:14px;padding:13px 0 2px;margin:0;border-top:1px solid #e5e7eb}
+.t-min h2{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--a);padding-top:2px}
+
+/* 6 Timeline */
+.t-time{padding:0 46px}
+.t-time .hd{display:flex;gap:18px;align-items:stretch;padding:2px 0 16px;border-bottom:1px solid #e5e7eb;margin-bottom:16px}
+.t-time .hd .bar{width:6px;background:var(--a);border-radius:3px;flex:none}
+.t-time h1{font-size:34px;line-height:1.1}
+.t-time .ttl{color:var(--a);font-size:15px;font-weight:600;margin:3px 0 6px}
+.t-time .cts{font-size:12px;color:#555}
+.t-time h2{font-size:13px;letter-spacing:1.6px;text-transform:uppercase;color:var(--ad);margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.t-time h2::before{content:"";width:10px;height:10px;background:var(--a);border-radius:2px}
+.t-time .tl{margin-left:4px}
+.t-time .tl .item{position:relative;padding:0 0 14px 22px;margin:0;border-left:2px solid var(--am)}
+.t-time .tl .item::before{content:"";position:absolute;left:-7px;top:3px;width:12px;height:12px;border-radius:50%;background:#fff;border:3px solid var(--a)}
+
+/* 7 Elegant */
+.t-ele{font-family:Georgia,"Palatino Linotype",serif;padding:0 56px}
+.t-ele .hd{text-align:center;padding:16px 0 14px;margin-bottom:16px;border-top:4px double var(--a);border-bottom:4px double var(--a)}
+.t-ele h1{font-size:30px;letter-spacing:6px;text-transform:uppercase;font-weight:400}
+.t-ele .ttl{letter-spacing:3px;text-transform:uppercase;font-size:11.5px;color:var(--ad);margin-top:6px}
+.t-ele .cts{justify-content:center;margin-top:8px;font-size:11.5px;color:#444;font-family:"Segoe UI",system-ui,Arial,sans-serif}
+.t-ele h2{font-size:12.5px;text-transform:uppercase;letter-spacing:2.4px;text-align:center;color:var(--ad);display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.t-ele h2::before,.t-ele h2::after{content:"";flex:1;height:1px;background:var(--am)}
+.t-ele .chips{justify-content:center}
+.t-ele .chips span{border-radius:2px;background:transparent}
+
+/* 8 Bold */
+.t-bold{padding:0 46px}
+.t-bold .hd{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;padding-bottom:16px;border-bottom:8px solid var(--a);margin-bottom:18px}
+.t-bold h1{font-size:44px;line-height:1;text-transform:uppercase;font-weight:900;letter-spacing:-1px;color:#111}
+.t-bold .ttl{background:var(--a);color:#fff;display:inline-block;padding:3px 12px;margin-top:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-size:12px}
+.t-bold .cts{flex-direction:column;align-items:flex-end;font-size:12px;color:#444;flex:none}
+.t-bold h2{font-size:15px;font-weight:900;text-transform:uppercase;letter-spacing:1px;color:var(--a);margin-bottom:8px}
+.t-bold .chips span{background:var(--a);color:#fff;border:0;border-radius:3px;font-weight:600}
+
+/* 9 Cards */
+.t-card{background:var(--at);padding:0 34px}
+.t-card .hd{background:#fff;border-radius:14px;padding:20px 22px;display:flex;justify-content:space-between;align-items:center;gap:20px;border:1px solid var(--am);border-left:6px solid var(--a);margin-bottom:14px}
+.t-card h1{font-size:30px;line-height:1.1}
+.t-card .ttl{color:var(--a);font-weight:600;font-size:14px;margin:3px 0 0}
+.t-card .cts{flex-direction:column;gap:0;font-size:12px;color:#444;flex:none}
+.t-card .sec{background:#fff;border-radius:12px;padding:15px 18px 4px;margin-bottom:14px;border:1px solid var(--am)}
+.t-card h2{font-size:12px;text-transform:uppercase;letter-spacing:1.6px;color:var(--a);margin-bottom:9px}
+.t-card .ph{width:84px;height:84px}
+
+/* 10 Creative */
+.t-cre{padding:0 40px}
+.t-cre .hd{display:flex;align-items:center;gap:22px;padding:6px 0 18px}
+.t-cre .av{width:112px;height:112px;border-radius:50%;background:linear-gradient(135deg,var(--a),var(--ad));color:#fff;display:flex;align-items:center;justify-content:center;font-size:40px;font-weight:800;flex:none;box-shadow:0 0 0 6px var(--am)}
+.t-cre .ph{box-shadow:0 0 0 6px var(--am)}
+.t-cre h1{font-size:34px;color:var(--ad);line-height:1.1}
+.t-cre .ttl{font-size:14px;color:#555;margin:3px 0 8px}
+.t-cre .cts .ct{background:var(--at);border:1px solid var(--am);padding:2px 10px;border-radius:999px;font-size:11.5px;margin:2px 0}
+.t-cre .g{display:grid;grid-template-columns:1fr 218px;gap:26px}
+.t-cre .sb{border-left:2px dashed var(--am);padding-left:20px}
+.t-cre h2{display:inline-block;background:var(--a);color:#fff;font-size:11.5px;letter-spacing:1.4px;text-transform:uppercase;padding:3px 12px;border-radius:999px;margin-bottom:9px}
+
+/* ---------- print ---------- */
+@media print{
+  @page{size:A4;margin:0}
+  html,body{background:#fff!important;height:auto!important;overflow:visible!important}
+  #app,.gal,.toast,.mnav{display:none!important}
+  #printRoot{display:block}
+}
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body id="artifacts-component-root-html">
+<div id="app">
+  <header class="top">
+    <div class="brand"><span class="logo"><svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"></path><path d="M9 12h6M9 16h6M9 8h2"></path></svg></span>Resume Studio <small id="tplCount">100 templates</small></div>
+    <button id="btnTpl" class="btn primary">🎨 Template: <span id="tplName">Sidebar Left · Indigo</span></button>
+    <div class="sp"></div>
+    <button id="btnSample" class="btn">Sample</button>
+    <button id="btnBlank" class="btn">New blank</button>
+    <button id="btnSave" class="btn">Save data</button>
+    <button id="btnLoad" class="btn">Load data</button>
+    <input type="file" id="fileLoad" accept=".json,application/json" hidden="">
+    <button id="btnTheme" class="btn round" title="Dark mode" aria-label="Dark mode">🌙</button>
+    <button id="btnPdf" class="btn accent">⬇ Download PDF</button>
+  </header>
+  <div class="main">
+    <aside class="editor">
+      <nav class="tabs" id="tabs"><button class="tab on" data-tab="personal">👤 Personal</button><button class="tab" data-tab="summary">📝 Summary</button><button class="tab" data-tab="exp">💼 Experience</button><button class="tab" data-tab="edu">🎓 Education</button><button class="tab" data-tab="proj">🚀 Projects</button><button class="tab" data-tab="skills">⚡ Skills</button></nav>
+      <div class="form" id="form"><div class="sectitle">Personal details</div><div class="photoRow"><div class="pav">👤</div><div><button class="btn sm" data-act="photo">Upload photo</button> <div class="hint">Optional — kuch templates me dikhegi</div></div></div><input type="file" id="photoIn" accept="image/*" hidden=""><div class="fld"><label>Full name</label><input data-p="name" type="text" value="Aarav Sharma" placeholder="e.g. Aarav Sharma"></div><div class="fld"><label>Job title</label><input data-p="title" type="text" value="Full Stack Developer" placeholder="e.g. Full Stack Developer"></div><div class="g2"><div class="fld"><label>Email</label><input data-p="email" type="email" value="aarav.sharma@email.com"></div><div class="fld"><label>Phone</label><input data-p="phone" type="text" value="+91 98765 43210"></div></div><div class="g2"><div class="fld"><label>Location</label><input data-p="location" type="text" value="New Delhi, India" placeholder="City, Country"></div><div class="fld"><label>Website</label><input data-p="website" type="text" value="aaravsharma.dev"></div></div><div class="fld"><label>LinkedIn / GitHub</label><input data-p="linkedin" type="text" value="linkedin.com/in/aarav-sharma"></div></div>
+    </aside>
+    <section class="preview" id="preview">
+      <div class="zoombar">
+        <button class="btn sm" id="zOut" aria-label="Zoom out">−</button><span id="zVal">100%</span><button class="btn sm" id="zIn" aria-label="Zoom in">+</button>
+        <button class="btn sm" id="zFit">Fit</button>
+        <span id="pages">1 page</span>
+      </div>
+      <div class="stage" id="stage"><div class="sheetWrap" id="sheetWrap" style="width: 794px; height: 1123px;"><div id="sheet" style="transform: scale(1);"><div class="rs t-side" style="--a:#4f46e5"><table class="pg"><thead><tr><td><i class="sp"></i></td></tr></thead><tbody><tr><td><div class="g"><div class="sb"><section class="sec "><h2>Contact</h2><div class="bd"><span class="ct"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path></svg><span>aarav.sharma@email.com</span></span><span class="ct"><svg viewBox="0 0 24 24"><path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"></path></svg><span>+91 98765 43210</span></span><span class="ct"><svg viewBox="0 0 24 24"><path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"></path><circle cx="12" cy="10" r="2.5"></circle></svg><span>New Delhi, India</span></span><span class="ct"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"></path></svg><span>aaravsharma.dev</span></span><span class="ct"><svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"></path><path d="M14 10a4 4 0 0 0-5.7 0l-3 3A4 4 0 0 0 11 18.7l1-1"></path></svg><span>linkedin.com/in/aarav-sharma</span></span></div></section><section class="sec "><h2>Skills</h2><div class="bd"><div class="chips"><span>JavaScript</span><span>React</span><span>Node.js</span><span>HTML5</span><span>CSS3</span><span>Python</span><span>SQL</span><span>Git</span><span>REST APIs</span><span>Figma</span></div></div></section><section class="sec "><h2>Languages</h2><div class="bd"><div class="ln">English</div><div class="ln">Hindi</div></div></section><section class="sec "><h2>Certifications</h2><div class="bd"><ul><li>Meta Front-End Developer Certificate</li><li>AWS Cloud Practitioner</li></ul></div></section></div><div class="mn"><h1>Aarav Sharma</h1><div class="ttl">Full Stack Developer</div><section class="sec "><h2>Profile</h2><div class="bd"><p>Detail-oriented developer with 2+ years of experience building fast, responsive web apps with React and Node.js. Passionate about clean UI, performance and shipping products people enjoy using.</p></div></section><section class="sec "><h2>Experience</h2><div class="bd"><div class="item"><div class="row"><div><span class="role">Frontend Developer</span><span class="org"> · BrightPixel Studio</span></div><span class="dt">Jan 2024 – Present</span></div><div class="sub">Remote</div><div class="desc"><ul><li>Built reusable React component library used across 6 client projects</li><li>Improved page load time by 38% with code-splitting and image optimisation</li><li>Collaborated with designers to ship pixel-perfect, accessible interfaces</li></ul></div></div><div class="item"><div class="row"><div><span class="role">Web Development Intern</span><span class="org"> · TechNova Solutions</span></div><span class="dt">Jun 2023 – Dec 2023</span></div><div class="sub">New Delhi</div><div class="desc"><ul><li>Developed REST APIs in Node.js and Express serving 5k+ daily requests</li><li>Wrote unit tests that raised coverage from 45% to 82%</li></ul></div></div></div></section><section class="sec "><h2>Education</h2><div class="bd"><div class="item"><div class="row"><div><span class="role">B.Tech in Computer Science</span><span class="org"> · ABC Institute of Technology</span></div><span class="dt">2020 – 2024</span></div><div class="sub">Delhi</div><div class="desc"><p>CGPA: 8.6 / 10 · Member of the Coding Club</p></div></div></div></section><section class="sec "><h2>Projects</h2><div class="bd"><div class="item"><div class="row"><span class="role">TaskFlow – Kanban App</span><span class="lnk">github.com/aarav/taskflow</span></div><div class="desc"><ul><li>Drag-and-drop task board with real-time sync using WebSockets</li><li>1,200+ monthly active users</li></ul></div></div><div class="item"><div class="row"><span class="role">Weather Pulse</span><span class="lnk">github.com/aarav/weather-pulse</span></div><div class="desc"><p>Minimal weather dashboard with 7-day forecast, charts and offline support.</p></div></div></div></section></div></div></td></tr></tbody><tfoot><tr><td><i class="sp"></i></td></tr></tfoot></table></div></div></div></div>
+    </section>
+  </div>
+</div>
+<div class="mnav" id="mnav"><button data-v="edit" class="on">✏️ Edit</button><button data-v="pv">👁 Preview</button></div>
+
+<div id="gallery" class="gal" hidden="">
+  <div class="galBox">
+    <div class="galHead">
+      <b>Choose a template</b>
+      <input id="galSearch" placeholder="Search templates… (e.g. bold, rose)" autocomplete="off">
+      <button class="btn" id="galClose">✕ Close</button>
+    </div>
+    <div class="cats" id="cats"></div>
+    <div class="galGrid" id="galGrid"></div>
+  </div>
+</div>
+<div id="printRoot"></div>
+<div class="toast" id="toast"></div>
+<noscript>JavaScript on karo, tabhi Resume Studio chalega.</noscript>
+
+<script>
+(function(){
+'use strict';
+/* ---------- helpers ---------- */
+var $=function(id){return document.getElementById(id)};
+var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
+var list=function(s){return String(s||'').split(/[\n,;]+/).map(function(x){return x.trim()}).filter(Boolean)};
+var lines=function(s){return String(s||'').split(/\n+/).map(function(x){return x.trim()}).filter(Boolean)};
+var dt=function(a,b){return [a,b].filter(function(x){return x&&String(x).trim()}).join(' – ')};
+function rich(t){
+  t=String(t||'').trim(); if(!t) return '';
+  var out='',ul=[];
+  function flush(){ if(ul.length){ out+='<ul>'+ul.map(function(x){return '<li>'+esc(x)+'</li>'}).join('')+'</ul>'; ul=[]; } }
+  t.split(/\r?\n/).forEach(function(l){
+    var m=l.match(/^\s*[-•*]\s+(.*)$/);
+    if(m) ul.push(m[1]); else if(l.trim()){ flush(); out+='<p>'+esc(l.trim())+'</p>'; }
+  });
+  flush(); return out;
+}
+var store={
+  get:function(k){try{return localStorage.getItem(k)}catch(e){return null}},
+  set:function(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+};
+var toastT;
+function toast(msg,ms){var t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastT);toastT=setTimeout(function(){t.classList.remove('show')},ms||2600)}
+
+/* ---------- data ---------- */
+function blank(){return {name:'',title:'',email:'',phone:'',location:'',website:'',linkedin:'',photo:'',summary:'',
+  exp:[{role:'',company:'',location:'',start:'',end:'',desc:''}],
+  edu:[{degree:'',school:'',location:'',start:'',end:'',desc:''}],
+  proj:[{name:'',link:'',desc:''}],skills:'',langs:'',certs:''}}
+var SAMPLE={name:'Aarav Sharma',title:'Full Stack Developer',email:'aarav.sharma@email.com',phone:'+91 98765 43210',location:'New Delhi, India',website:'aaravsharma.dev',linkedin:'linkedin.com/in/aarav-sharma',photo:'',
+  summary:'Detail-oriented developer with 2+ years of experience building fast, responsive web apps with React and Node.js. Passionate about clean UI, performance and shipping products people enjoy using.',
+  exp:[
+   {role:'Frontend Developer',company:'BrightPixel Studio',location:'Remote',start:'Jan 2024',end:'Present',desc:'- Built reusable React component library used across 6 client projects\n- Improved page load time by 38% with code-splitting and image optimisation\n- Collaborated with designers to ship pixel-perfect, accessible interfaces'},
+   {role:'Web Development Intern',company:'TechNova Solutions',location:'New Delhi',start:'Jun 2023',end:'Dec 2023',desc:'- Developed REST APIs in Node.js and Express serving 5k+ daily requests\n- Wrote unit tests that raised coverage from 45% to 82%'}],
+  edu:[{degree:'B.Tech in Computer Science',school:'ABC Institute of Technology',location:'Delhi',start:'2020',end:'2024',desc:'CGPA: 8.6 / 10 · Member of the Coding Club'}],
+  proj:[{name:'TaskFlow – Kanban App',link:'github.com/aarav/taskflow',desc:'- Drag-and-drop task board with real-time sync using WebSockets\n- 1,200+ monthly active users'},
+        {name:'Weather Pulse',link:'github.com/aarav/weather-pulse',desc:'Minimal weather dashboard with 7-day forecast, charts and offline support.'}],
+  skills:'JavaScript, React, Node.js, HTML5, CSS3, Python, SQL, Git, REST APIs, Figma',
+  langs:'English, Hindi',certs:'Meta Front-End Developer Certificate\nAWS Cloud Practitioner'};
+var D=blank();
+
+/* ---------- icons + parts ---------- */
+var IC={mail:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+ phone:'<path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"/>',
+ pin:'<path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/>',
+ globe:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/>',
+ link:'<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3A4 4 0 0 0 11 18.7l1-1"/>'};
+function P(d){
+  var nm=(d.name||'').trim()||'Your Name', w=nm.split(/\s+/);
+  var cts=[]; function add(k,v){ if(v&&String(v).trim()) cts.push('<span class="ct"><svg viewBox="0 0 24 24">'+IC[k]+'</svg><span>'+esc(v)+'</span></span>'); }
+  add('mail',d.email);add('phone',d.phone);add('pin',d.location);add('globe',d.website);add('link',d.linkedin);
+  var sk=list(d.skills), lg=list(d.langs), ce=lines(d.certs);
+  var exp=(d.exp||[]).filter(function(x){return x.role||x.company}).map(function(x){
+    return '<div class="item"><div class="row"><div><span class="role">'+esc(x.role)+'</span>'+(x.company?'<span class="org">'+(x.role?' · ':'')+esc(x.company)+'</span>':'')+'</div><span class="dt">'+esc(dt(x.start,x.end))+'</span></div>'+(x.location?'<div class="sub">'+esc(x.location)+'</div>':'')+(x.desc?'<div class="desc">'+rich(x.desc)+'</div>':'')+'</div>'}).join('');
+  var edu=(d.edu||[]).filter(function(x){return x.degree||x.school}).map(function(x){
+    return '<div class="item"><div class="row"><div><span class="role">'+esc(x.degree)+'</span>'+(x.school?'<span class="org">'+(x.degree?' · ':'')+esc(x.school)+'</span>':'')+'</div><span class="dt">'+esc(dt(x.start,x.end))+'</span></div>'+(x.location?'<div class="sub">'+esc(x.location)+'</div>':'')+(x.desc?'<div class="desc">'+rich(x.desc)+'</div>':'')+'</div>'}).join('');
+  var proj=(d.proj||[]).filter(function(x){return x.name}).map(function(x){
+    return '<div class="item"><div class="row"><span class="role">'+esc(x.name)+'</span>'+(x.link?'<span class="lnk">'+esc(x.link)+'</span>':'')+'</div>'+(x.desc?'<div class="desc">'+rich(x.desc)+'</div>':'')+'</div>'}).join('');
+  var ini=w.slice(0,2).map(function(s){return s.charAt(0)}).join('').toUpperCase();
+  return {name:esc(nm),first:esc(w[0]),rest:esc(w.slice(1).join(' ')),ini:esc(ini),title:esc(d.title||''),cts:cts,
+    photo:(d.photo&&/^data:image\//.test(d.photo))?'<img class="ph" src="'+d.photo+'" alt="">':'',
+    sum:rich(d.summary),exp:exp,edu:edu,proj:proj,
+    chips:sk.length?'<div class="chips">'+sk.map(function(s){return '<span>'+esc(s)+'</span>'}).join('')+'</div>':'',
+    skTxt:esc(sk.join(' · ')),
+    langs:lg.map(function(x){return '<div class="ln">'+esc(x)+'</div>'}).join(''),
+    langTxt:esc(lg.join(' · ')),
+    certs:ce.length?'<ul>'+ce.map(function(x){return '<li>'+esc(x)+'</li>'}).join('')+'</ul>':''};
+}
+function S(t,inner,c){return inner?'<section class="sec '+(c||'')+'"><h2>'+t+'</h2><div class="bd">'+inner+'</div></section>':''}
+function T(p){return p.title?'<div class="ttl">'+p.title+'</div>':''}
+
+/* ---------- layouts ---------- */
+function bClassic(p){
+  return '<div class="hd"><h1>'+p.name+'</h1>'+T(p)+'<div class="cts">'+p.cts.join('')+'</div></div>'+
+   S('Profile',p.sum)+S('Experience',p.exp,'tl')+S('Education',p.edu,'tl')+S('Projects',p.proj)+S('Skills',p.chips)+S('Certifications',p.certs)+S('Languages',p.langs);
+}
+function bSide(p){
+  return '<div class="g"><div class="sb">'+p.photo+S('Contact',p.cts.join(''))+S('Skills',p.chips)+S('Languages',p.langs)+S('Certifications',p.certs)+'</div>'+
+   '<div class="mn"><h1>'+p.name+'</h1>'+T(p)+S('Profile',p.sum)+S('Experience',p.exp)+S('Education',p.edu)+S('Projects',p.proj)+'</div></div>';
+}
+function bSideR(p){
+  return '<div class="g"><div class="mn"><h1>'+p.name+'</h1>'+T(p)+'<div class="bar"></div>'+S('Profile',p.sum)+S('Experience',p.exp)+S('Projects',p.proj)+'</div>'+
+   '<div class="sb">'+p.photo+S('Contact',p.cts.join(''))+S('Education',p.edu)+S('Skills',p.chips)+S('Languages',p.langs)+S('Certifications',p.certs)+'</div></div>';
+}
+function bBanner(p){
+  return '<div class="bn"><div><h1>'+p.name+'</h1>'+T(p)+'<div class="cts">'+p.cts.join('')+'</div></div>'+p.photo+'</div>'+
+   '<div class="g"><div>'+S('Profile',p.sum)+S('Experience',p.exp)+S('Projects',p.proj)+'</div><div>'+S('Skills',p.chips)+S('Education',p.edu)+S('Languages',p.langs)+S('Certifications',p.certs)+'</div></div>';
+}
+function bMin(p){
+  var nm=p.rest?p.first+' <b>'+p.rest+'</b>':'<b>'+p.first+'</b>';
+  return '<div class="hd"><h1>'+nm+'</h1>'+T(p)+'<div class="cts">'+p.cts.join('')+'</div></div>'+
+   S('Profile',p.sum)+S('Experience',p.exp)+S('Education',p.edu)+S('Projects',p.proj)+S('Skills',p.chips)+S('Certifications',p.certs)+S('Languages',p.langs);
+}
+function bTime(p){
+  return '<div class="hd"><div class="bar"></div><div><h1>'+p.name+'</h1>'+T(p)+'<div class="cts">'+p.cts.join('')+'</div></div></div>'+
+   S('Profile',p.sum)+S('Experience',p.exp,'tl')+S('Education',p.edu,'tl')+S('Projects',p.proj)+S('Skills',p.chips)+S('Certifications',p.certs)+S('Languages',p.langs);
+}
+function bEle(p){
+  return '<div class="hd"><h1>'+p.name+'</h1>'+T(p)+'<div class="cts">'+p.cts.join('')+'</div></div>'+
+   S('Profile',p.sum)+S('Experience',p.exp)+S('Education',p.edu)+S('Projects',p.proj)+S('Skills',p.chips)+S('Certifications',p.certs)+S('Languages',p.langs);
+}
+function bBold(p){
+  return '<div class="hd"><div><h1>'+p.name+'</h1>'+T(p)+'</div><div class="cts">'+p.cts.join('')+'</div></div>'+
+   S('Profile',p.sum)+S('Experience',p.exp)+S('Education',p.edu)+S('Projects',p.proj)+S('Skills',p.chips)+S('Certifications',p.certs)+S('Languages',p.langs);
+}
+function bCard(p){
+  return '<div class="hd">'+(p.photo?p.photo:'')+'<div style="flex:1"><h1>'+p.name+'</h1>'+T(p)+'</div><div class="cts">'+p.cts.join('')+'</div></div>'+
+   S('Profile',p.sum)+S('Experience',p.exp)+S('Education',p.edu)+S('Projects',p.proj)+S('Skills',p.chips)+S('Certifications',p.certs)+S('Languages',p.langs);
+}
+function bCre(p){
+  return '<div class="hd">'+(p.photo||'<div class="av">'+p.ini+'</div>')+'<div><h1>'+p.name+'</h1>'+T(p)+'<div class="cts">'+p.cts.join('')+'</div></div></div>'+
+   '<div class="g"><div>'+S('Profile',p.sum)+S('Experience',p.exp)+S('Projects',p.proj)+'</div><div class="sb">'+S('Skills',p.chips)+S('Education',p.edu)+S('Languages',p.langs)+S('Certifications',p.certs)+'</div></div>';
+}
+var LAYOUTS=[{id:'classic',name:'Classic',b:bClassic},{id:'side',name:'Sidebar Left',b:bSide},{id:'sider',name:'Sidebar Right',b:bSideR},
+ {id:'banner',name:'Banner',b:bBanner},{id:'min',name:'Minimal',b:bMin},{id:'time',name:'Timeline',b:bTime},{id:'ele',name:'Elegant',b:bEle},
+ {id:'bold',name:'Bold',b:bBold},{id:'card',name:'Cards',b:bCard},{id:'cre',name:'Creative',b:bCre}];
+var PAL=[{n:'Indigo',c:'#4f46e5'},{n:'Emerald',c:'#059669'},{n:'Rose',c:'#e11d48'},{n:'Amber',c:'#d97706'},{n:'Sky',c:'#0284c7'},
+ {n:'Violet',c:'#7c3aed'},{n:'Slate',c:'#334155'},{n:'Teal',c:'#0f766e'},{n:'Crimson',c:'#b91c1c'},{n:'Orange',c:'#ea580c'}];
+var TPLS=[];
+PAL.forEach(function(pl,pi){LAYOUTS.forEach(function(ly,li){TPLS.push({id:TPLS.length,l:li,p:pi,cat:ly.name,name:ly.name+' · '+pl.n})})});
+var TPL=0;
+
+function renderResume(d,t){
+  var L=LAYOUTS[t.l], p=P(d);
+  return '<div class="rs t-'+L.id+'" style="--a:'+PAL[t.p].c+'"><table class="pg"><thead><tr><td><i class="sp"></i></td></tr></thead><tbody><tr><td>'+L.b(p)+'</td></tr></tbody><tfoot><tr><td><i class="sp"></i></td></tr></tfoot></table></div>';
+}
+
+/* ---------- preview ---------- */
+var Z=1, fitMode=true, SP=34, PAGE=1122, lastH=1123;
+function applyZoom(){
+  $('sheetWrap').style.width=(794*Z)+'px';
+  $('sheetWrap').style.height=(lastH*Z)+'px';
+  $('sheet').style.transform='scale('+Z+')';
+  $('zVal').textContent=Math.round(Z*100)+'%';
+}
+function fit(){
+  var w=$('stage').clientWidth-(window.innerWidth<=900?24:60);
+  if(w<=0) return;
+  Z=Math.max(.3,Math.min(1.25,w/794)); fitMode=true; applyZoom();
+}
+function refresh(){
+  var sh=$('sheet');
+  sh.innerHTML=renderResume(D,TPLS[TPL]);
+  var rs=sh.firstChild, body=rs.querySelector('tbody');
+  lastH=rs.offsetHeight||1123;
+  var area=PAGE-2*SP, pages=Math.max(1,Math.ceil((body.offsetHeight-2)/area)), h='';
+  for(var k=1;k<pages;k++) h+='<div class="pgline" style="top:'+(SP+k*area)+'px"><span>Page '+(k+1)+'</span></div>';
+  sh.insertAdjacentHTML('beforeend',h);
+  $('pages').textContent=pages+(pages>1?' pages':' page');
+  applyZoom();
+  $('tplName').textContent=TPLS[TPL].name;
+  store.set('rs:data',JSON.stringify(D)); store.set('rs:tpl',String(TPL));
+}
+var rt; function sched(){clearTimeout(rt);rt=setTimeout(refresh,70)}
+
+/* ---------- form ---------- */
+var TABS=[['personal','👤 Personal'],['summary','📝 Summary'],['exp','💼 Experience'],['edu','🎓 Education'],['proj','🚀 Projects'],['skills','⚡ Skills']];
+var TAB='personal';
+function F(label,path,val,o){
+  o=o||{}; var ph=o.ph?' placeholder="'+esc(o.ph)+'"':'', el;
+  if(o.ta) el='<textarea data-p="'+path+'" rows="'+(o.r||4)+'"'+ph+'>'+esc(val)+'</textarea>';
+  else el='<input data-p="'+path+'" type="'+(o.type||'text')+'" value="'+esc(val)+'"'+ph+'>';
+  return '<div class="fld"><label>'+label+'</label>'+el+'</div>';
+}
+function listTab(key,label,mk){
+  return D[key].map(function(x,i){
+    return '<div class="card"><div class="ch"><span>'+label+' '+(i+1)+'</span><span class="ib">'+
+      '<button class="ibtn" data-act="up" data-k="'+key+'" data-i="'+i+'" title="Move up">↑</button>'+
+      '<button class="ibtn" data-act="down" data-k="'+key+'" data-i="'+i+'" title="Move down">↓</button>'+
+      '<button class="ibtn del" data-act="del" data-k="'+key+'" data-i="'+i+'" title="Remove">✕</button></span></div>'+mk(x,i)+'</div>';
+  }).join('')+'<button class="add" data-add="'+key+'">＋ Add '+label+'</button>';
+}
+var BL={exp:{role:'',company:'',location:'',start:'',end:'',desc:''},edu:{degree:'',school:'',location:'',start:'',end:'',desc:''},proj:{name:'',link:'',desc:''}};
+var DESC_HINT='Har line ke shuru me "- " likhoge to bullet point banega';
+function renderForm(){
+  var h='';
+  if(TAB==='personal'){
+    h='<div class="sectitle">Personal details</div><div class="photoRow"><div class="pav">'+(D.photo?'<img src="'+D.photo+'" alt="">':'👤')+'</div><div><button class="btn sm" data-act="photo">Upload photo</button> '+(D.photo?'<button class="btn sm" data-act="rmphoto">Remove</button>':'')+'<div class="hint">Optional — kuch templates me dikhegi</div></div></div><input type="file" id="photoIn" accept="image/*" hidden>'+
+      F('Full name','name',D.name,{ph:'e.g. Aarav Sharma'})+F('Job title','title',D.title,{ph:'e.g. Full Stack Developer'})+
+      '<div class="g2">'+F('Email','email',D.email,{type:'email'})+F('Phone','phone',D.phone)+'</div>'+
+      '<div class="g2">'+F('Location','location',D.location,{ph:'City, Country'})+F('Website','website',D.website)+'</div>'+
+      F('LinkedIn / GitHub','linkedin',D.linkedin);
+  } else if(TAB==='summary'){
+    h='<div class="sectitle">Profile summary</div>'+F('About you','summary',D.summary,{ta:1,r:9,ph:'2–4 lines me apna introduction likho'})+'<div class="hint">Chhota aur impactful rakho — 3 se 4 lines best hoti hain.</div>';
+  } else if(TAB==='exp'){
+    h='<div class="sectitle">Work experience</div>'+listTab('exp','Experience',function(x,i){var b='exp.'+i+'.';
+      return '<div class="g2">'+F('Job title',b+'role',x.role)+F('Company',b+'company',x.company)+'</div>'+F('Location',b+'location',x.location)+
+        '<div class="g2">'+F('Start',b+'start',x.start,{ph:'Jan 2023'})+F('End',b+'end',x.end,{ph:'Present'})+'</div>'+F('Description',b+'desc',x.desc,{ta:1,r:5,ph:'- Achievement 1\n- Achievement 2'})+'<div class="hint">'+DESC_HINT+'</div>'});
+  } else if(TAB==='edu'){
+    h='<div class="sectitle">Education</div>'+listTab('edu','Education',function(x,i){var b='edu.'+i+'.';
+      return '<div class="g2">'+F('Degree / Course',b+'degree',x.degree)+F('School / College',b+'school',x.school)+'</div>'+F('Location',b+'location',x.location)+
+        '<div class="g2">'+F('Start',b+'start',x.start,{ph:'2020'})+F('End',b+'end',x.end,{ph:'2024'})+'</div>'+F('Details',b+'desc',x.desc,{ta:1,r:3,ph:'CGPA, achievements…'})});
+  } else if(TAB==='proj'){
+    h='<div class="sectitle">Projects</div>'+listTab('proj','Project',function(x,i){var b='proj.'+i+'.';
+      return '<div class="g2">'+F('Project name',b+'name',x.name)+F('Link',b+'link',x.link,{ph:'github.com/you/project'})+'</div>'+F('Description',b+'desc',x.desc,{ta:1,r:4})+'<div class="hint">'+DESC_HINT+'</div>'});
+  } else {
+    h='<div class="sectitle">Skills &amp; more</div>'+F('Skills','skills',D.skills,{ta:1,r:4,ph:'JavaScript, React, Python…'})+'<div class="hint" style="margin:-6px 0 14px">Comma ya nayi line se alag karo.</div>'+
+      F('Languages','langs',D.langs,{ph:'English, Hindi'})+F('Certifications','certs',D.certs,{ta:1,r:4,ph:'Ek line me ek certificate'});
+  }
+  $('form').innerHTML=h;
+}
+function renderTabs(){
+  $('tabs').innerHTML=TABS.map(function(t){return '<button class="tab'+(t[0]===TAB?' on':'')+'" data-tab="'+t[0]+'">'+t[1]+'</button>'}).join('');
+}
+function setPath(path,v){
+  var a=path.split('.'),o=D; for(var i=0;i<a.length-1;i++) o=o[a[i]]; o[a[a.length-1]]=v;
+}
+function photoFromFile(f){
+  if(!f) return;
+  var r=new FileReader();
+  r.onload=function(){
+    var im=new Image();
+    im.onload=function(){
+      var s=Math.min(1,420/Math.max(im.width,im.height)), c=document.createElement('canvas');
+      c.width=Math.round(im.width*s); c.height=Math.round(im.height*s);
+      c.getContext('2d').drawImage(im,0,0,c.width,c.height);
+      D.photo=c.toDataURL('image/jpeg',.86); renderForm(); sched();
+    };
+    im.onerror=function(){toast('Ye image open nahi ho paayi')};
+    im.src=r.result;
+  };
+  r.readAsDataURL(f);
+}
+$('form').addEventListener('input',function(e){var p=e.target.getAttribute&&e.target.getAttribute('data-p'); if(p){setPath(p,e.target.value);sched()}});
+$('form').addEventListener('change',function(e){ if(e.target.id==='photoIn') photoFromFile(e.target.files[0]); });
+$('form').addEventListener('click',function(e){
+  var b=e.target.closest('button'); if(!b) return;
+  var act=b.getAttribute('data-act'), add=b.getAttribute('data-add'), k=b.getAttribute('data-k'), i=+b.getAttribute('data-i');
+  if(add){ D[add].push(JSON.parse(JSON.stringify(BL[add]))); renderForm(); sched(); var cs=$('form').querySelectorAll('.card'); if(cs.length) cs[cs.length-1].scrollIntoView({behavior:'smooth',block:'nearest'}); return; }
+  if(act==='photo'){ $('photoIn').click(); return; }
+  if(act==='rmphoto'){ D.photo=''; renderForm(); sched(); return; }
+  if(act==='del'){ D[k].splice(i,1); renderForm(); sched(); }
+  else if(act==='up'&&i>0){ var t=D[k][i]; D[k][i]=D[k][i-1]; D[k][i-1]=t; renderForm(); sched(); }
+  else if(act==='down'&&i<D[k].length-1){ var t2=D[k][i]; D[k][i]=D[k][i+1]; D[k][i+1]=t2; renderForm(); sched(); }
+});
+$('tabs').addEventListener('click',function(e){var b=e.target.closest('.tab'); if(!b) return; TAB=b.getAttribute('data-tab'); renderTabs(); renderForm();});
+
+/* ---------- gallery ---------- */
+var CAT='All', io=null;
+function hasContent(){return !!(D.name||D.summary||D.skills||D.exp.some(function(x){return x.role||x.company})||D.edu.some(function(x){return x.degree||x.school}))}
+function drawCard(prev){
+  if(prev.getAttribute('data-done')) return; prev.setAttribute('data-done','1');
+  var t=TPLS[+prev.getAttribute('data-id')], pv=document.createElement('div'); pv.className='pv';
+  pv.innerHTML=renderResume(hasContent()?D:SAMPLE,t);
+  pv.style.transform='scale('+(prev.clientWidth/794)+')'; prev.appendChild(pv);
+}
+function buildGallery(){
+  var q=$('galSearch').value.trim().toLowerCase();
+  var items=TPLS.filter(function(t){return (CAT==='All'||t.cat===CAT)&&(!q||t.name.toLowerCase().indexOf(q)>-1)});
+  $('galGrid').innerHTML=items.length?items.map(function(t){
+    return '<div class="tcard'+(t.id===TPL?' on':'')+'" data-id="'+t.id+'" tabindex="0" role="button" aria-label="'+esc(t.name)+'"><div class="tprev" data-id="'+t.id+'"></div><div class="tinfo"><b>'+esc(t.name)+'</b><span>Template '+(t.id+1)+'</span></div></div>';
+  }).join(''):'<div class="empty">Koi template nahi mila 🙁</div>';
+  if(io) io.disconnect();
+  io=new IntersectionObserver(function(en){en.forEach(function(x){if(x.isIntersecting){drawCard(x.target);io.unobserve(x.target)}})},{root:$('galGrid'),rootMargin:'300px'});
+  $('galGrid').querySelectorAll('.tprev').forEach(function(p){io.observe(p)});
+}
+function buildCats(){
+  var cs=['All'].concat(LAYOUTS.map(function(l){return l.name}));
+  $('cats').innerHTML=cs.map(function(c){return '<button class="cat'+(c===CAT?' on':'')+'" data-c="'+esc(c)+'">'+esc(c)+'</button>'}).join('');
+}
+function openGal(){ $('gallery').hidden=false; buildCats(); buildGallery(); var on=$('galGrid').querySelector('.tcard.on'); if(on) on.scrollIntoView({block:'center'}); }
+function closeGal(){ $('gallery').hidden=true; }
+$('btnTpl').onclick=openGal; $('galClose').onclick=closeGal;
+$('gallery').addEventListener('click',function(e){ if(e.target.id==='gallery') closeGal(); });
+$('galSearch').addEventListener('input',buildGallery);
+$('cats').addEventListener('click',function(e){var b=e.target.closest('.cat'); if(!b) return; CAT=b.getAttribute('data-c'); buildCats(); buildGallery();});
+function pick(c){ if(!c) return; TPL=+c.getAttribute('data-id'); closeGal(); refresh(); toast('Template: '+TPLS[TPL].name); }
+$('galGrid').addEventListener('click',function(e){pick(e.target.closest('.tcard'))});
+$('galGrid').addEventListener('keydown',function(e){ if(e.key==='Enter'||e.key===' '){ var c=e.target.closest('.tcard'); if(c){e.preventDefault();pick(c)} } });
+document.addEventListener('keydown',function(e){ if(e.key==='Escape'&&!$('gallery').hidden) closeGal(); });
+
+/* ---------- toolbar actions ---------- */
+function normalize(o){
+  var b=blank(), r={}; Object.keys(b).forEach(function(k){ r[k]=(o&&o[k]!=null)?o[k]:b[k]; });
+  ['exp','edu','proj'].forEach(function(k){ if(!Array.isArray(r[k])||!r[k].length) r[k]=[JSON.parse(JSON.stringify(BL[k]))]; r[k]=r[k].map(function(x){return Object.assign({},BL[k],x)}); });
+  return r;
+}
+$('btnSample').onclick=function(){ D=normalize(JSON.parse(JSON.stringify(SAMPLE))); renderForm(); refresh(); toast('Sample data load ho gaya'); };
+$('btnBlank').onclick=function(){ if(hasContent()&&!confirm('Saara data clear ho jayega. Continue?')) return; D=blank(); renderForm(); refresh(); };
+$('btnSave').onclick=function(){
+  var blob=new Blob([JSON.stringify({template:TPL,data:D},null,2)],{type:'application/json'}), a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=((D.name||'resume').trim().replace(/[^\w\-]+/g,'_')||'resume')+'-data.json';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(a.href)},1000); toast('Data save ho gaya (.json)');
+};
+$('btnLoad').onclick=function(){ $('fileLoad').click(); };
+$('fileLoad').onchange=function(e){
+  var f=e.target.files[0]; if(!f) return; var r=new FileReader();
+  r.onload=function(){ try{ var j=JSON.parse(r.result); D=normalize(j.data||j); if(typeof j.template==='number'&&TPLS[j.template]) TPL=j.template; renderForm(); refresh(); toast('Data load ho gaya'); }catch(err){ toast('File galat hai — sahi .json chuno'); } };
+  r.readAsText(f); e.target.value='';
+};
+$('btnPdf').onclick=function(){
+  var rs=$('sheet').querySelector('.rs'); if(!rs) return;
+  $('printRoot').innerHTML=rs.outerHTML;
+  var old=document.title; document.title=((D.name||'Resume').trim().replace(/[^\w\- ]+/g,'')||'Resume')+' - Resume';
+  function done(){ document.title=old; $('printRoot').innerHTML=''; window.removeEventListener('afterprint',done); }
+  window.addEventListener('afterprint',done);
+  var framed=false; try{ framed=(window.self!==window.top); }catch(e){ framed=true; }
+  if(framed){ toast('Preview ke andar print block hota hai — is file ko Chrome me kholo ya GitHub link se chalao',5200); }
+  else { toast('Print window me Destination: "Save as PDF" chuno',3600); }
+  setTimeout(function(){ try{ window.print(); }catch(err){ toast('Print nahi khula — Chrome me kholkar try karo',4000); } },200);
+};
+$('zIn').onclick=function(){fitMode=false;Z=Math.min(2,Z+.1);applyZoom()};
+$('zOut').onclick=function(){fitMode=false;Z=Math.max(.3,Z-.1);applyZoom()};
+$('zFit').onclick=fit;
+window.addEventListener('resize',function(){ if(fitMode) fit(); });
+
+/* theme */
+function setTheme(m){ document.documentElement.setAttribute('data-theme',m); $('btnTheme').textContent=m==='dark'?'☀️':'🌙'; $('btnTheme').title=m==='dark'?'Light mode':'Dark mode'; store.set('rs:theme',m); }
+$('btnTheme').onclick=function(){ setTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark'); };
+setTheme(store.get('rs:theme')||((window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light'));
+
+/* mobile nav */
+$('mnav').addEventListener('click',function(e){
+  var b=e.target.closest('button'); if(!b) return; var pv=b.getAttribute('data-v')==='pv';
+  document.body.classList.toggle('pv',pv);
+  $('mnav').querySelectorAll('button').forEach(function(x){x.classList.toggle('on',x===b)});
+  if(pv) setTimeout(fit,30);
+});
+
+/* ---------- init ---------- */
+(function(){
+  var sd=store.get('rs:data'), st=store.get('rs:tpl');
+  if(sd){ try{ D=normalize(JSON.parse(sd)); }catch(e){ D=normalize(JSON.parse(JSON.stringify(SAMPLE))); } }
+  else D=normalize(JSON.parse(JSON.stringify(SAMPLE)));
+  if(st!=null&&TPLS[+st]) TPL=+st;
+  $('tplCount').textContent=TPLS.length+' templates';
+  renderTabs(); renderForm(); refresh(); fit();
+  if('ResizeObserver' in window) new ResizeObserver(function(){ if(fitMode) fit(); }).observe($('stage'));
+})();
+})();
+</script>
+
+
+</body></html>
